@@ -64,17 +64,42 @@ router.patch('/me/availability', async (request, response, next) => {
     return response.status(400).json({ error: 'Availability must be offline, available, or busy.' });
   }
 
+  const client = await pool.connect();
+
   try {
-    const result = await pool.query(
+    await client.query('BEGIN');
+    await client.query(
+      `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+      [request.user.sub]
+    );
+
+    if (availability === 'available') {
+      const activeRide = await client.query(
+        `SELECT 1 FROM rides WHERE driver_id = $1 AND status IN ('accepted', 'in_progress') FOR UPDATE`,
+        [request.user.sub]
+      );
+
+      if (activeRide.rowCount > 0) {
+        await client.query('ROLLBACK');
+        return response.status(409).json({ error: 'Driver already has an active ride.' });
+      }
+    }
+
+    const result = await client.query(
       `UPDATE users SET availability = $1
        WHERE id = $2
        RETURNING id, name, email, role, availability, latitude, longitude, location_updated_at`,
       [availability, request.user.sub]
     );
 
+    await client.query('COMMIT');
+
     return response.json({ driver: result.rows[0] });
   } catch (error) {
+    await client.query('ROLLBACK');
     return next(error);
+  } finally {
+    client.release();
   }
 });
 
