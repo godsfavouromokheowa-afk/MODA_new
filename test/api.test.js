@@ -120,7 +120,14 @@ test('registration and login return public user data and a token', async () => {
     .patch('/auth/me/password')
     .set(headers)
     .send({ currentPassword: 'NewRideSafe123', newPassword: testPassword });
-  assert.equal(restorePassword.status, 200);
+  assert.equal(restorePassword.status, 401);
+  assert.deepEqual(restorePassword.body, { error: 'A valid bearer token is required.' });
+
+  const loginAfterChange = await request(app)
+    .post('/auth/login')
+    .send({ email: testEmail, password: 'NewRideSafe123' });
+  assert.equal(loginAfterChange.status, 200);
+  const changedHeaders = { Authorization: `Bearer ${loginAfterChange.body.token}` };
 
   const resetRequest = await request(app)
     .post('/auth/password-reset/request')
@@ -140,9 +147,20 @@ test('registration and login return public user data and a token', async () => {
 
   const restoreAfterReset = await request(app)
     .patch('/auth/me/password')
-    .set(headers)
+    .set(changedHeaders)
     .send({ currentPassword: 'ResetRide123', newPassword: testPassword });
-  assert.equal(restoreAfterReset.status, 200);
+  assert.equal(restoreAfterReset.status, 401);
+  assert.deepEqual(restoreAfterReset.body, { error: 'A valid bearer token is required.' });
+
+  const finalLogin = await request(app)
+    .post('/auth/login')
+    .send({ email: testEmail, password: 'ResetRide123' });
+  assert.equal(finalLogin.status, 200);
+  const finalRestore = await request(app)
+    .patch('/auth/me/password')
+    .set('Authorization', `Bearer ${finalLogin.body.token}`)
+    .send({ currentPassword: 'ResetRide123', newPassword: testPassword });
+  assert.equal(finalRestore.status, 200);
 });
 
 test('rides require authentication', async () => {
@@ -155,6 +173,7 @@ test('route IDs reject malformed values', async () => {
   const login = await request(app)
     .post('/auth/login')
     .send({ email: testEmail, password: testPassword });
+  assert.equal(login.status, 200);
   const response = await request(app)
     .get('/rides/not-an-id')
     .set('Authorization', `Bearer ${login.body.token}`);
@@ -168,6 +187,7 @@ test('admins cannot demote their own account', async () => {
   const login = await request(app)
     .post('/auth/login')
     .send({ email: testEmail, password: testPassword });
+  assert.equal(login.status, 200);
   const response = await request(app)
     .patch(`/admin/users/${login.body.user.id}/role`)
     .set('Authorization', `Bearer ${login.body.token}`)
@@ -196,6 +216,7 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
   const driver = await registerUser('Test Driver', driverEmail);
   const rider = await registerUser('Test Rider', riderEmail);
   const driverId = driver.user.id;
+  const riderId = rider.user.id;
 
   const adminLogin = await request(app)
     .post('/auth/login')
@@ -203,21 +224,32 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
   const adminHeaders = { Authorization: `Bearer ${adminLogin.body.token}` };
   const application = await request(app)
     .post('/drivers/apply')
-    .set({ Authorization: `Bearer ${rider.token}` });
+    .set({ Authorization: `Bearer ${driver.token}` });
   assert.equal(application.status, 202);
   assert.equal(application.body.application.driver_application_status, 'pending');
 
   const approvedApplication = await request(app)
-    .patch(`/admin/driver-applications/${rider.user.id}`)
+    .patch(`/admin/driver-applications/${driverId}`)
     .set(adminHeaders)
     .send({ status: 'approved' });
   assert.equal(approvedApplication.status, 200);
   assert.equal(approvedApplication.body.application.role, 'driver');
   assert.equal(approvedApplication.body.application.driver_application_status, 'approved');
 
+  const staleDriverTokenRejected = await request(app)
+    .post('/drivers/apply')
+    .set({ Authorization: `Bearer ${driver.token}` });
+  assert.equal(staleDriverTokenRejected.status, 409);
+  assert.deepEqual(staleDriverTokenRejected.body, { error: 'Only rider accounts can submit a driver application.' });
+
+  const driverRelogin = await request(app)
+    .post('/auth/login')
+    .send({ email: driverEmail, password: testPassword });
+  assert.equal(driverRelogin.status, 200);
+
   const applicationNotifications = await request(app)
     .get('/notifications')
-    .set({ Authorization: `Bearer ${rider.token}` });
+    .set({ Authorization: `Bearer ${driverRelogin.body.token}` });
   assert.ok(applicationNotifications.body.notifications.some(
     (notification) => notification.type === 'driver_application_approved'
   ));
@@ -329,6 +361,13 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .send({ pickupLocation: 'Airport', dropoffLocation: 'Station' });
   assert.equal(rideRequest.status, 201);
 
+  const nonDriverAccept = await request(app)
+    .patch(`/rides/${rideRequest.body.ride.id}/accept`)
+    .set(riderHeaders)
+    .send({ vehicleId: vehicle.id });
+  assert.equal(nonDriverAccept.status, 403);
+  assert.deepEqual(nonDriverAccept.body, { error: 'You do not have permission to perform this action.' });
+
   const invalidCompletion = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/status`)
     .set(driverHeaders)
@@ -356,6 +395,30 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .set(driverHeaders)
     .send({ vehicleId: vehicle.id });
   assert.equal(doubleBooking.status, 409);
+
+  const availabilityWhileBusy = await request(app)
+    .patch('/drivers/me/availability')
+    .set(driverHeaders)
+    .send({ availability: 'available' });
+  assert.equal(availabilityWhileBusy.status, 409);
+  assert.equal(availabilityWhileBusy.body.error, 'Driver already has an active ride.');
+
+  const stillBusy = await request(app)
+    .get('/drivers/me')
+    .set(driverHeaders);
+  assert.equal(stillBusy.body.driver.availability, 'busy');
+
+  const offlineWhileBusy = await request(app)
+    .patch('/drivers/me/availability')
+    .set(driverHeaders)
+    .send({ availability: 'offline' });
+  assert.equal(offlineWhileBusy.status, 200);
+
+  const backToBusy = await request(app)
+    .patch('/drivers/me/availability')
+    .set(driverHeaders)
+    .send({ availability: 'busy' });
+  assert.equal(backToBusy.status, 200);
 
   const excessiveRate = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/pricing`)
@@ -404,6 +467,41 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .send({ status: 'in_progress' });
   assert.equal(inProgress.status, 200);
   assert.equal(inProgress.body.ride.status, 'in_progress');
+
+  const riderRide = await request(app)
+    .get(`/rides/${rideRequest.body.ride.id}`)
+    .set(riderHeaders);
+  assert.equal(riderRide.status, 200);
+  assert.ok('pickup_latitude' in riderRide.body.ride);
+  assert.ok('pickup_longitude' in riderRide.body.ride);
+  assert.equal(riderRide.body.ride.fare_confirmed_by_rider, false);
+
+  const riderRides = await request(app)
+    .get('/rides')
+    .set(riderHeaders);
+  assert.equal(riderRides.status, 200);
+  assert.ok(riderRides.body.rides.some(
+    (item) => item.id === rideRequest.body.ride.id
+      && 'pickup_latitude' in item && 'pickup_longitude' in item
+  ));
+
+  const completeWithoutConfirm = await request(app)
+    .patch(`/rides/${rideRequest.body.ride.id}/status`)
+    .set(driverHeaders)
+    .send({ status: 'completed' });
+  assert.equal(completeWithoutConfirm.status, 409);
+  assert.equal(completeWithoutConfirm.body.error, 'Rider has not confirmed the fare.');
+
+  const nonRiderConfirm = await request(app)
+    .patch(`/rides/${rideRequest.body.ride.id}/confirm-fare`)
+    .set(driverHeaders);
+  assert.equal(nonRiderConfirm.status, 409);
+
+  const confirmedFare = await request(app)
+    .patch(`/rides/${rideRequest.body.ride.id}/confirm-fare`)
+    .set(riderHeaders);
+  assert.equal(confirmedFare.status, 200);
+  assert.equal(confirmedFare.body.ride.fare_confirmed_by_rider, true);
 
   const completed = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/status`)
@@ -469,6 +567,12 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .set(driverHeaders);
   assert.equal(markedPaidAgain.status, 409);
 
+  const settledIntent = await request(app)
+    .post(`/payments/rides/${rideRequest.body.ride.id}/intent`)
+    .set(riderHeaders);
+  assert.equal(settledIntent.status, 409);
+  assert.equal(settledIntent.body.error, 'This ride already has a settled payment.');
+
   const driverHistory = await request(app)
     .get('/drivers/me/rides')
     .set(driverHeaders);
@@ -489,6 +593,87 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .set(riderHeaders);
   assert.equal(cancelled.status, 200);
   assert.equal(cancelled.body.ride.status, 'cancelled');
+
+  const demoted = await request(app)
+    .patch(`/admin/users/${driverId}/role`)
+    .set(adminHeaders)
+    .send({ role: 'rider' });
+  assert.equal(demoted.status, 200);
+  assert.equal(demoted.body.user.driver_application_status, 'not_applicable');
+
+  const staleDriverAccess = await request(app)
+    .patch('/drivers/me/availability')
+    .set(driverHeaders)
+    .send({ availability: 'offline' });
+  assert.equal(staleDriverAccess.status, 403);
+
+  const staleDriverProfile = await request(app)
+    .get('/drivers/me')
+    .set(driverHeaders);
+  assert.equal(staleDriverProfile.status, 403);
+
+  const passwordStaleToken = riderHeaders.Authorization;
+
+  const changedPassword = await request(app)
+    .patch('/auth/me/password')
+    .set(riderHeaders)
+    .send({ currentPassword: testPassword, newPassword: 'RideSafe456' });
+  assert.equal(changedPassword.status, 200);
+
+  const oldPasswordTokenRejected = await request(app)
+    .get('/auth/me')
+    .set('Authorization', passwordStaleToken);
+  assert.equal(oldPasswordTokenRejected.status, 401);
+
+  const relogin = await request(app)
+    .post('/auth/login')
+    .send({ email: riderEmail, password: 'RideSafe456' });
+  assert.equal(relogin.status, 200);
+  const freshRiderHeaders = { Authorization: `Bearer ${relogin.body.token}` };
+
+  const freshTokenWorks = await request(app)
+    .get('/auth/me')
+    .set(freshRiderHeaders);
+  assert.equal(freshTokenWorks.status, 200);
+
+  const changeBack = await request(app)
+    .patch('/auth/me/password')
+    .set(freshRiderHeaders)
+    .send({ currentPassword: 'RideSafe456', newPassword: testPassword });
+  assert.equal(changeBack.status, 200);
+
+  const resetLogin = await request(app)
+    .post('/auth/login')
+    .send({ email: riderEmail, password: testPassword });
+  assert.equal(resetLogin.status, 200);
+  const resetHeaders = { Authorization: `Bearer ${resetLogin.body.token}` };
+
+  const resetRequest = await request(app)
+    .post('/auth/password-reset/request')
+    .send({ email: riderEmail });
+  assert.equal(resetRequest.status, 202);
+
+  const resetConfirm = await request(app)
+    .post('/auth/password-reset/confirm')
+    .send({ token: resetRequest.body.resetToken, newPassword: 'RideSafe789' });
+  assert.equal(resetConfirm.status, 200);
+
+  const preResetTokenRejected = await request(app)
+    .get('/auth/me')
+    .set(resetHeaders);
+  assert.equal(preResetTokenRejected.status, 401);
+
+  const postResetLogin = await request(app)
+    .post('/auth/login')
+    .send({ email: riderEmail, password: 'RideSafe789' });
+  assert.equal(postResetLogin.status, 200);
+  const postResetHeaders = { Authorization: `Bearer ${postResetLogin.body.token}` };
+
+  const restorePassword = await request(app)
+    .patch('/auth/me/password')
+    .set(postResetHeaders)
+    .send({ currentPassword: 'RideSafe789', newPassword: testPassword });
+  assert.equal(restorePassword.status, 200);
 });
 
 test('versioned API exposes the health endpoint', async () => {

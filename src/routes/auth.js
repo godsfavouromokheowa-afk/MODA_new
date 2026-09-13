@@ -1,3 +1,7 @@
+// Authentication endpoints: public registration and login (issue JWTs),
+// password change, and the request/confirm password-reset flow. Only the
+// /me routes below require a logged-in user; everything else is public so new
+// and logged-out users can sign up, sign in, or recover access.
 const express = require('express');
 const crypto = require('node:crypto');
 const bcrypt = require('bcryptjs');
@@ -8,14 +12,18 @@ const { requireAuth } = require('../middleware/auth');
 
 const router = express.Router();
 
+// Signs a 7-day JWT carrying the user id, role, and token version. The token
+// version is what lets password changes and resets invalidate older tokens.
 function createToken(user) {
     return jwt.sign(
-        { sub: String(user.id), role: user.role },
+        { sub: String(user.id), role: user.role, token_version: Number(user.token_version ?? 1) },
         env.jwtSecret,
         { expiresIn: '7d' }
     );
 }
 
+// Shapes the safe user object sent to clients. Never includes the password
+// hash or other internal columns.
 function publicUser(user) {
     return {
         id: user.id,
@@ -25,10 +33,14 @@ function publicUser(user) {
     };
 }
 
+// Hashes a reset token with SHA-256 so only the hash is stored — a database
+// leak alone never reveals usable reset links.
 function hashResetToken(token) {
     return crypto.createHash('sha256').update(token).digest('hex');
 }
 
+// Public: creates an account. Normalizes the email and stores only a bcrypt
+// hash of the password; a taken email returns 409.
 router.post('/register', async (request, response, next) => {
     const { name, email, password } = request.body;
 
@@ -48,7 +60,7 @@ router.post('/register', async (request, response, next) => {
         const result = await pool.query(
             `INSERT INTO users (name, email, password_hash)
        VALUES ($1, $2, $3)
-       RETURNING id, name, email, role`,
+       RETURNING id, name, email, role, token_version`,
             [name.trim(), normalizedEmail, passwordHash]
         );
         const user = result.rows[0];
@@ -65,6 +77,8 @@ router.post('/register', async (request, response, next) => {
     }
 });
 
+// Public: checks email + password and returns a fresh token. The error is
+// deliberately generic so attackers can't probe which emails exist.
 router.post('/login', async (request, response, next) => {
     const { email, password } = request.body;
 
@@ -74,7 +88,7 @@ router.post('/login', async (request, response, next) => {
 
     try {
         const result = await pool.query(
-            'SELECT id, name, email, role, password_hash FROM users WHERE email = $1',
+            'SELECT id, name, email, role, password_hash, token_version FROM users WHERE email = $1',
             [email.trim().toLowerCase()]
         );
         const user = result.rows[0];
@@ -93,6 +107,8 @@ router.post('/login', async (request, response, next) => {
     }
 });
 
+// Public: starts a password reset. Always returns the same generic message
+// whether or not the email exists, so accounts can't be enumerated.
 router.post('/password-reset/request', async (request, response, next) => {
     const { email } = request.body;
     const genericResponse = {
@@ -135,18 +151,22 @@ router.post('/password-reset/request', async (request, response, next) => {
     }
 });
 
+// Public: finishes a password reset. Marks the reset token used and bumps the
+// token version in one transaction, so every previously issued JWT stops
+// working and the user must log in again.
 router.post('/password-reset/confirm', async (request, response, next) => {
-    const { resetToken, newPassword } = request.body;
+    const { resetToken, token, newPassword } = request.body;
+    const suppliedToken = resetToken ?? token;
 
     if (
-        typeof resetToken !== 'string' || !resetToken ||
+        typeof suppliedToken !== 'string' || !suppliedToken ||
         typeof newPassword !== 'string' || newPassword.length < 8
     ) {
         return response.status(400).json({ error: 'A reset token and a new password of at least 8 characters are required.' });
     }
 
     try {
-        const tokenHash = hashResetToken(resetToken);
+        const tokenHash = hashResetToken(suppliedToken);
         const token = await pool.query(
             `SELECT id, user_id FROM password_reset_tokens
              WHERE token_hash = $1 AND used_at IS NULL AND expires_at > NOW()`,
@@ -158,11 +178,12 @@ router.post('/password-reset/confirm', async (request, response, next) => {
         }
 
         const passwordHash = await bcrypt.hash(newPassword, 12);
-        const client = await pool.connect();
+        let client;
         try {
+            client = await pool.connect();
             await client.query('BEGIN');
             await client.query(
-                'UPDATE users SET password_hash = $1 WHERE id = $2',
+                'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
                 [passwordHash, token.rows[0].user_id]
             );
             const used = await client.query(
@@ -178,10 +199,12 @@ router.post('/password-reset/confirm', async (request, response, next) => {
 
             await client.query('COMMIT');
         } catch (error) {
-            await client.query('ROLLBACK');
+            if (client) {
+                try { await client.query('ROLLBACK'); } catch (_) {}
+            }
             throw error;
         } finally {
-            client.release();
+            if (client) client.release();
         }
 
         return response.json({ message: 'Password reset successfully.' });
@@ -190,6 +213,8 @@ router.post('/password-reset/confirm', async (request, response, next) => {
     }
 });
 
+// Logged-in user: returns their own profile, including driver application
+// status and current availability/location.
 router.get('/me', requireAuth, async (request, response, next) => {
     try {
         const result = await pool.query(
@@ -209,6 +234,8 @@ router.get('/me', requireAuth, async (request, response, next) => {
     }
 });
 
+// Logged-in user: renames their account or changes email. A taken email
+// returns 409 via the database unique constraint.
 router.patch('/me', requireAuth, async (request, response, next) => {
     const { name, email } = request.body;
 
@@ -225,7 +252,7 @@ router.patch('/me', requireAuth, async (request, response, next) => {
             `UPDATE users
              SET name = COALESCE($1, name), email = COALESCE($2, email)
              WHERE id = $3
-             RETURNING id, name, email, role`,
+             RETURNING id, name, email, role, token_version`,
             [name === undefined ? null : name.trim(), email === undefined ? null : email.trim().toLowerCase(), request.user.sub]
         );
 
@@ -242,6 +269,8 @@ router.patch('/me', requireAuth, async (request, response, next) => {
     }
 });
 
+// Logged-in user: changes password after proving the current one. Bumps the
+// token version so all older sessions are logged out immediately.
 router.patch('/me/password', requireAuth, async (request, response, next) => {
     const { currentPassword, newPassword } = request.body;
 
@@ -267,11 +296,11 @@ router.patch('/me/password', requireAuth, async (request, response, next) => {
 
         const passwordHash = await bcrypt.hash(newPassword, 12);
         await pool.query(
-            'UPDATE users SET password_hash = $1 WHERE id = $2',
+            'UPDATE users SET password_hash = $1, token_version = token_version + 1 WHERE id = $2',
             [passwordHash, request.user.sub]
         );
 
-        return response.json({ message: 'Password updated successfully.' });
+        return response.json({ message: 'Password updated successfully. Please log in again.' });
     } catch (error) {
         return next(error);
     }

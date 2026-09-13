@@ -1,3 +1,6 @@
+// Vehicle management: lets approved drivers register and maintain the cars
+// they drive with. Every route here requires an approved driver and only ever
+// touches the caller's own vehicles.
 const express = require('express');
 const { pool } = require('../config/database');
 const { requireAuth, requireApprovedDriver } = require('../middleware/auth');
@@ -7,6 +10,8 @@ const router = express.Router();
 
 router.use(requireAuth, requireApprovedDriver);
 
+// Approved driver: registers a vehicle. Plates are uppercased and globally
+// unique — a duplicate plate returns 409.
 router.post('/', async (request, response, next) => {
   const { make, model, licensePlate } = request.body;
 
@@ -35,6 +40,7 @@ router.post('/', async (request, response, next) => {
   }
 });
 
+// Approved driver: lists their own vehicles, newest first.
 router.get('/', async (request, response, next) => {
   try {
     const result = await pool.query(
@@ -49,6 +55,8 @@ router.get('/', async (request, response, next) => {
   }
 });
 
+// Approved driver: activates or deactivates one of their vehicles. Only an
+// active vehicle can accept or be assigned rides.
 router.patch('/:id/status', requirePositiveIntegerParam('id'), async (request, response, next) => {
   const { status } = request.body;
 
@@ -74,6 +82,8 @@ router.patch('/:id/status', requirePositiveIntegerParam('id'), async (request, r
   }
 });
 
+// Approved driver: edits a vehicle's details. Like registration, a plate
+// taken by another vehicle returns 409.
 router.patch('/:id', requirePositiveIntegerParam('id'), async (request, response, next) => {
   const { make, model, licensePlate } = request.body;
 
@@ -106,6 +116,8 @@ router.patch('/:id', requirePositiveIntegerParam('id'), async (request, response
   }
 });
 
+// Approved driver: deletes a vehicle that has never been used by a ride.
+// Vehicles with ride history are kept (409) so past trips still reference a car.
 router.delete('/:id', requirePositiveIntegerParam('id'), async (request, response, next) => {
   try {
     const result = await pool.query(

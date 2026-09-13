@@ -9,9 +9,10 @@ const router = express.Router();
 router.use(requireAuth);
 
 router.post('/rides/:id/intent', requirePositiveIntegerParam('id'), async (request, response, next) => {
-  const client = await pool.connect();
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
     const ride = await client.query(
       `SELECT id, rider_id, fare, currency, status
@@ -29,6 +30,16 @@ router.post('/rides/:id/intent', requirePositiveIntegerParam('id'), async (reque
       return response.status(409).json({ error: 'Only completed rides with a fare can be paid.' });
     }
 
+    const existing = await client.query(
+      `SELECT id, status FROM payments WHERE ride_id = $1 FOR UPDATE`,
+      [ride.rows[0].id]
+    );
+
+    if (existing.rowCount > 0 && existing.rows[0].status !== 'pending') {
+      await client.query('ROLLBACK');
+      return response.status(409).json({ error: 'This ride already has a settled payment.' });
+    }
+
     const payment = await client.query(
       `INSERT INTO payments (ride_id, rider_id, amount, currency, provider, provider_reference)
        VALUES ($1, $2, $3, 'NGN', 'unconfigured', $4)
@@ -41,10 +52,12 @@ router.post('/rides/:id/intent', requirePositiveIntegerParam('id'), async (reque
     await client.query('COMMIT');
     return response.status(201).json({ payment: payment.rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
@@ -68,9 +81,10 @@ router.get('/:id', requirePositiveIntegerParam('id'), async (request, response, 
 });
 
 router.patch('/:id/mark-paid', requirePositiveIntegerParam('id'), requireRole('driver', 'admin'), async (request, response, next) => {
-  const client = await pool.connect();
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
     const result = await client.query(
       `SELECT payments.id, payments.status, rides.driver_id, rides.status AS ride_status
@@ -115,10 +129,12 @@ router.patch('/:id/mark-paid', requirePositiveIntegerParam('id'), requireRole('d
     await client.query('COMMIT');
     return response.json({ payment: updated.rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

@@ -43,6 +43,9 @@ Authentication endpoints are rate-limited, and the API sends standard security h
 All API routes allow up to 300 requests per 15 minutes per client IP. Authentication endpoints have an additional 50-request limit in the same window.
 Every response includes an `x-request-id` header for tracing. Unknown routes return JSON `404` responses.
 Admin authorization is checked against the database on each admin request, so role changes invalidate older JWTs immediately. This costs one extra indexed user lookup per admin request; caching is intentionally not used because revocation should take effect immediately.
+Driver authorization is also checked against the live user row on every driver request: demoting a driver (or changing their approval status) invalidates their old driver JWT immediately.
+Any role change, driver-approval decision, password change, or password reset requires the user to log in again — old tokens stop working.
+Password change (`PATCH /auth/me/password`) and password reset confirmation (`POST /auth/password-reset/confirm`) bump an internal token version, so every previously issued token returns `401` on its next use.
 
 | Method | Endpoint | Access |
 | --- | --- | --- |
@@ -61,9 +64,12 @@ Password reset requests always return a generic response. In development only, t
 | Method | Endpoint | Access |
 | --- | --- | --- |
 | POST | `/rides` | Authenticated |
-| GET | `/rides` | Authenticated |
-| GET | `/rides/:id` | Authenticated |
+| GET | `/rides` | Authenticated — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
+| GET | `/rides/:id` | Authenticated — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
 | PATCH | `/rides/:id/cancel` | Authenticated |
+| PATCH | `/rides/:id/confirm-fare` | Ride's rider only, while `accepted`/`in_progress` with a priced fare — sets `fare_confirmed_by_rider=true`, else `409` |
+
+A ride can only transition to `completed` when it has a fare **and** the rider has confirmed it (`fare_confirmed_by_rider=true`); otherwise completion returns `409 { error: 'Rider has not confirmed the fare.' }`. Price the ride (`PATCH /rides/:id/pricing`), have the rider confirm (`PATCH /rides/:id/confirm-fare`), then complete it.
 
 ## Payment endpoints
 
@@ -74,6 +80,7 @@ Password reset requests always return a generic response. In development only, t
 | PATCH | `/payments/:id/mark-paid` | Assigned driver or admin | Confirm a cash payment for a completed ride |
 
 Payment records are provider-neutral until Paystack or Flutterwave credentials are configured. The amount is copied from the completed ride fare and cannot be supplied by the client.
+Repeating the intent for the same ride returns the same pending payment with `201`. If the payment is already settled (`paid`, `failed`, or `refunded`), the intent returns `409 { error: 'This ride already has a settled payment.' }`.
 
 ## Notification endpoints
 
@@ -100,7 +107,7 @@ Create a ride with:
 | GET | `/drivers/me` | View driver availability and location |
 | GET | `/drivers/me/rides` | View assigned ride history |
 | POST | `/drivers/apply` | Submit a driver application |
-| PATCH | `/drivers/me/availability` | Set `offline`, `available`, or `busy` |
+| PATCH | `/drivers/me/availability` | Set `offline`, `available`, or `busy` — setting `available` while on an `accepted`/`in_progress` ride returns `409 { error: 'Driver already has an active ride.' }` |
 | PATCH | `/drivers/me/location` | Update latitude and longitude |
 | POST | `/vehicles` | Register a vehicle |
 | GET | `/vehicles` | List owned vehicles |
@@ -149,7 +156,7 @@ This produces `NGN 3,125.00`.
 | GET | `/admin/users` | List users |
 | GET | `/admin/driver-applications` | Review driver applications |
 | PATCH | `/admin/driver-applications/:id` | Approve or reject an application |
-| PATCH | `/admin/users/:id/role` | Set `rider`, `driver`, or `admin` |
+| PATCH | `/admin/users/:id/role` | Set `rider`, `driver`, or `admin` — demoting a driver clears approval to `not_applicable`; any actual role change forces re-login |
 | GET | `/admin/rides` | Monitor all rides |
 | GET | `/admin/rides?status=requested` | Filter rides by status |
 | PATCH | `/admin/rides/:id/assign` | Assign a matching driver and vehicle |

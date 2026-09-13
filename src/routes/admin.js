@@ -55,20 +55,28 @@ router.patch('/users/:id/role', requirePositiveIntegerParam('id'), async (reques
     const result = await pool.query(
       `UPDATE users
        SET role = $1,
-           role_changed_at = CASE WHEN role IS DISTINCT FROM $1 THEN NOW() ELSE role_changed_at END
+           role_changed_at = CASE WHEN role IS DISTINCT FROM $1 THEN NOW() ELSE role_changed_at END,
+           driver_application_status = CASE
+             WHEN $1 IN ('rider', 'admin') AND role = 'driver' THEN 'not_applicable'
+             ELSE driver_application_status
+           END
        WHERE id = $2
-       RETURNING id, name, email, role, role_changed_at, created_at`,
+       RETURNING id, name, email, role, role_changed_at, driver_application_status, created_at`,
       [role, targetUserId]
     );
 
     if (currentUser.rows[0].role !== role) {
-      await createNotification({
-        userId: result.rows[0].id,
-        type: 'role_changed',
-        title: 'Account role updated',
-        message: `Your account role is now ${role}.`,
-        data: { userId: result.rows[0].id, role }
-      });
+      try {
+        await createNotification({
+          userId: result.rows[0].id,
+          type: 'role_changed',
+          title: 'Account role updated',
+          message: `Your account role is now ${role}. Please log in again.`,
+          data: { userId: result.rows[0].id, role }
+        });
+      } catch (notificationError) {
+        console.error('Failed to create role_changed notification:', notificationError);
+      }
     }
 
     return response.json({ user: result.rows[0] });
@@ -105,7 +113,11 @@ router.patch('/driver-applications/:id', requirePositiveIntegerParam('id'), asyn
       `UPDATE users
        SET driver_application_status = $1,
            driver_application_reviewed_at = NOW(),
-           role = CASE WHEN $1 = 'approved' THEN 'driver' ELSE 'rider' END
+           role = CASE WHEN $1 = 'approved' THEN 'driver' ELSE 'rider' END,
+           role_changed_at = CASE
+             WHEN $1 = 'approved' AND role IS DISTINCT FROM 'driver' THEN NOW()
+             ELSE role_changed_at
+           END
        WHERE id = $2 AND driver_application_status = 'pending'
        RETURNING id, name, email, role, driver_application_status,
                  driver_application_submitted_at, driver_application_reviewed_at`,
@@ -116,13 +128,19 @@ router.patch('/driver-applications/:id', requirePositiveIntegerParam('id'), asyn
       return response.status(409).json({ error: 'A pending driver application was not found.' });
     }
 
-    await createNotification({
-      userId: result.rows[0].id,
-      type: `driver_application_${status}`,
-      title: `Driver application ${status}`,
-      message: `Your driver application has been ${status}.`,
-      data: { userId: result.rows[0].id, status }
-    });
+    try {
+      await createNotification({
+        userId: result.rows[0].id,
+        type: `driver_application_${status}`,
+        title: `Driver application ${status}`,
+        message: status === 'approved'
+          ? 'Your driver application has been approved. Please log in again.'
+          : 'Your driver application has been rejected.',
+        data: { userId: result.rows[0].id, status }
+      });
+    } catch (notificationError) {
+      console.error('Failed to create driver_application notification:', notificationError);
+    }
 
     return response.json({ application: result.rows[0] });
   } catch (error) {

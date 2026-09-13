@@ -1,3 +1,6 @@
+// Request logging: stamps every request with an ID (reusing the caller's when
+// provided) and logs one JSON line with method, path, status, and duration
+// once the response finishes — this is how requests are traced in production.
 const crypto = require('node:crypto');
 
 function requestLogger(request, response, next) {
