@@ -189,14 +189,20 @@ router.patch('/rides/:id/assign', requirePositiveIntegerParam('id'), async (requ
     return response.status(400).json({ error: 'Valid driverId and vehicleId are required.' });
   }
 
-  const client = await pool.connect();
+  // Lock order: users then rides.
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
+    // Lock the driver row first (before any ride rows) so concurrent accept /
+    // match / assignment requests can't deadlock against each other.
     await client.query(
       `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
       [driverIdNumber]
     );
+    // Rejects double-booking inside the same transaction, so two simultaneous
+    // assignments can't both slip through.
     const activeRide = await client.query(
       `SELECT 1 FROM rides WHERE driver_id = $1 AND status IN ('accepted', 'in_progress') FOR UPDATE`,
       [driverIdNumber]
@@ -229,6 +235,8 @@ router.patch('/rides/:id/assign', requirePositiveIntegerParam('id'), async (requ
       return response.status(409).json({ error: 'Ride is unavailable or driver and vehicle do not match.' });
     }
 
+    // The driver goes busy in the same transaction as the assignment, keeping
+    // availability and real ride state in sync.
     await client.query(
       `UPDATE users SET availability = 'busy' WHERE id = $1`,
       [driverIdNumber]
@@ -237,21 +245,35 @@ router.patch('/rides/:id/assign', requirePositiveIntegerParam('id'), async (requ
 
     return response.json({ ride: result.rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
+    // Maps a leaked unique-index violation to the same friendly 409 clients
+    // already get from the explicit active-ride check above.
+    if (error && error.code === '23505') {
+      if (client) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+      }
+      return response.status(409).json({ error: 'Driver already has an active ride.' });
+    }
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 
 router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (request, response, next) => {
-  const client = await pool.connect();
+  // Lock order: users then rides.
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
+    // Read the ride without locking first so we can locate a nearby driver;
+    // the ride row itself is re-locked after the driver lock below.
     const ride = await client.query(
       `SELECT id, pickup_latitude, pickup_longitude
-       FROM rides WHERE id = $1 AND status = 'requested' FOR UPDATE`,
+       FROM rides WHERE id = $1 AND status = 'requested'`,
       [request.params.id]
     );
 
@@ -265,6 +287,10 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
       return response.status(409).json({ error: 'Ride pickup coordinates are required for matching.' });
     }
 
+    // Find the nearest available, recently-heard-from driver and lock their
+    // user + vehicle rows before any ride locks. SKIP LOCKED means a driver
+    // currently being claimed by another matcher is skipped instead of stalling
+    // dispatch, staying compatible with the ORDER BY distance LIMIT 1 scan.
     const driver = await client.query(
       `SELECT users.id AS driver_id, vehicles.id AS vehicle_id,
               (
@@ -287,7 +313,7 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
          AND users.location_updated_at >= NOW() - INTERVAL '15 minutes'
        ORDER BY distance_km ASC, users.id ASC
        LIMIT 1
-       FOR UPDATE OF users, vehicles`,
+       FOR UPDATE OF users, vehicles SKIP LOCKED`,
       [ride.rows[0].pickup_latitude, ride.rows[0].pickup_longitude]
     );
 
@@ -296,6 +322,8 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
       return response.status(409).json({ error: 'No available driver with a recent location was found.' });
     }
 
+    // Rejects double-booking inside the same transaction, so two simultaneous
+    // match / accept / assign requests can't both slip through.
     const activeRide = await client.query(
       `SELECT 1 FROM rides
        WHERE driver_id = $1 AND status IN ('accepted', 'in_progress')
@@ -308,6 +336,19 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
       return response.status(409).json({ error: 'Driver already has an active ride.' });
     }
 
+    // Re-lock the ride now (after the driver lock) and confirm it is still
+    // requested, so a concurrent accept or assign that already won it can't be
+    // overwritten.
+    const stillRequested = await client.query(
+      `SELECT id FROM rides WHERE id = $1 AND status = 'requested' FOR UPDATE`,
+      [request.params.id]
+    );
+
+    if (stillRequested.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return response.status(409).json({ error: 'Ride is unavailable for matching.' });
+    }
+
     const assigned = await client.query(
       `UPDATE rides
        SET driver_id = $1, vehicle_id = $2, status = 'accepted', accepted_at = NOW()
@@ -317,6 +358,13 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
       [driver.rows[0].driver_id, driver.rows[0].vehicle_id, request.params.id]
     );
 
+    if (assigned.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return response.status(409).json({ error: 'Ride is unavailable for matching.' });
+    }
+
+    // The driver goes busy in the same transaction as the match, keeping
+    // availability and real ride state in sync.
     await client.query(
       `UPDATE users SET availability = 'busy' WHERE id = $1`,
       [driver.rows[0].driver_id]
@@ -328,10 +376,20 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
       match: { driverId: driver.rows[0].driver_id, vehicleId: driver.rows[0].vehicle_id }
     });
   } catch (error) {
-    await client.query('ROLLBACK');
+    // Maps a leaked unique-index violation to the same friendly 409 clients
+    // already get from the explicit active-ride check above.
+    if (error && error.code === '23505') {
+      if (client) {
+        try { await client.query('ROLLBACK'); } catch (_) {}
+      }
+      return response.status(409).json({ error: 'Driver already has an active ride.' });
+    }
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

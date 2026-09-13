@@ -396,6 +396,44 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .send({ vehicleId: vehicle.id });
   assert.equal(doubleBooking.status, 409);
 
+  const assignDoubleBooking = await request(app)
+    .patch(`/admin/rides/${secondRide.body.ride.id}/assign`)
+    .set(adminHeaders)
+    .send({ driverId, vehicleId: vehicle.id });
+  assert.equal(assignDoubleBooking.status, 409);
+  assert.equal(assignDoubleBooking.body.error, 'Driver already has an active ride.');
+
+  const matchDoubleBookingRide = await request(app)
+    .post('/rides')
+    .set(riderHeaders)
+    .send({
+      pickupLocation: 'Third Pickup',
+      dropoffLocation: 'Third Dropoff',
+      pickupLatitude: 6.5244,
+      pickupLongitude: 3.3792
+    });
+  assert.equal(matchDoubleBookingRide.status, 201);
+
+  const matchDoubleBooking = await request(app)
+    .post(`/admin/rides/${matchDoubleBookingRide.body.ride.id}/match`)
+    .set(adminHeaders);
+  assert.equal(matchDoubleBooking.status, 409);
+  assert.equal(matchDoubleBooking.body.error, 'No available driver with a recent location was found.');
+
+  const stillRequestedAfterMatch = await pool.query(
+    'SELECT status FROM rides WHERE id = $1',
+    [matchDoubleBookingRide.body.ride.id]
+  );
+  assert.equal(stillRequestedAfterMatch.rowCount, 1);
+  assert.equal(stillRequestedAfterMatch.rows[0].status, 'requested');
+
+  const activeRideCount = await pool.query(
+    `SELECT COUNT(*) FROM rides
+     WHERE driver_id = $1 AND status IN ('accepted', 'in_progress')`,
+    [driverId]
+  );
+  assert.equal(Number(activeRideCount.rows[0].count), 1);
+
   const availabilityWhileBusy = await request(app)
     .patch('/drivers/me/availability')
     .set(driverHeaders)
