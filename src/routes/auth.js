@@ -9,6 +9,7 @@ const jwt = require('jsonwebtoken');
 const { pool } = require('../config/database');
 const env = require('../config/env');
 const { requireAuth } = require('../middleware/auth');
+const { sendPasswordResetEmail } = require('../services/mailer');
 
 const router = express.Router();
 
@@ -120,9 +121,10 @@ router.post('/password-reset/request', async (request, response, next) => {
     }
 
     try {
+        const normalizedEmail = email.trim().toLowerCase();
         const user = await pool.query(
             'SELECT id FROM users WHERE email = $1',
-            [email.trim().toLowerCase()]
+            [normalizedEmail]
         );
 
         if (user.rowCount === 0) {
@@ -141,7 +143,15 @@ router.post('/password-reset/request', async (request, response, next) => {
             [user.rows[0].id, hashResetToken(resetToken)]
         );
 
-        if (env.nodeEnv !== 'production') {
+        try {
+            await sendPasswordResetEmail({ to: normalizedEmail, resetToken });
+        } catch (mailError) {
+            console.error('Failed to send password reset email:', mailError);
+        }
+
+        // Never put the raw token in a production response. Tests and local
+        // development still receive it so the flow can be exercised without SMTP.
+        if (env.nodeEnv === 'development' || env.nodeEnv === 'test') {
             return response.status(202).json({ ...genericResponse, resetToken });
         }
 

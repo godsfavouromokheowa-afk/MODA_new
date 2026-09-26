@@ -31,14 +31,20 @@ const generalLimiter = rateLimit({
   message: { error: 'Too many requests. Try again later.' }
 });
 
-app.use(helmet());
+app.use(helmet({
+  hsts: {
+    maxAge: 15552000,
+    includeSubDomains: true,
+    preload: false
+  }
+}));
 app.use(requestLogger);
 app.use(cors({
   origin: env.corsOrigins.includes('*') ? '*' : env.corsOrigins,
   methods: ['GET', 'POST', 'PATCH', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.use(express.json());
+app.use(express.json({ limit: env.jsonBodyLimit }));
 app.use(generalLimiter);
 
 function mountApiRoutes(router) {
@@ -61,6 +67,10 @@ app.use((_request, response) => {
 });
 
 app.use((error, _request, response, _next) => {
+  if (error && (error.type === 'entity.too.large' || error.status === 413)) {
+    return response.status(413).json({ error: 'Request body is too large.' });
+  }
+
   console.error(error);
   response.status(500).json({
     status: 'error',
