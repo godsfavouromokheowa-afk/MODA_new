@@ -252,7 +252,7 @@ router.patch('/me', requireAuth, async (request, response, next) => {
             `UPDATE users
              SET name = COALESCE($1, name), email = COALESCE($2, email)
              WHERE id = $3
-             RETURNING id, name, email, role, token_version`,
+             RETURNING id, name, email, role`,
             [name === undefined ? null : name.trim(), email === undefined ? null : email.trim().toLowerCase(), request.user.sub]
         );
 

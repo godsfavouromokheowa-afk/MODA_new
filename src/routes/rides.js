@@ -93,11 +93,30 @@ router.get('/:id', requirePositiveIntegerParam('id'), async (request, response, 
 // in a transaction so the ride row and the driver's freed availability update
 // together; a driver who already went offline stays offline.
 router.patch('/:id/cancel', requirePositiveIntegerParam('id'), async (request, response, next) => {
+  // Lock order: users then rides.
   let client;
 
   try {
     client = await pool.connect();
     await client.query('BEGIN');
+    const current = await client.query(
+      `SELECT id, driver_id, status FROM rides
+       WHERE id = $1 AND rider_id = $2 AND status IN ('requested', 'accepted')`,
+      [request.params.id, request.user.sub]
+    );
+
+    if (current.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return response.status(409).json({ error: 'Only requested or accepted rides can be cancelled.' });
+    }
+
+    if (current.rows[0].driver_id) {
+      await client.query(
+        `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+        [current.rows[0].driver_id]
+      );
+    }
+
     const result = await client.query(
       `UPDATE rides
        SET status = 'cancelled', completed_at = NOW()
@@ -157,8 +176,9 @@ router.patch('/:id/cancel', requirePositiveIntegerParam('id'), async (request, r
 router.get('/available/list', requireApprovedDriver, async (_request, response, next) => {
   try {
     const result = await pool.query(
-            `SELECT id, rider_id, pickup_location, dropoff_location, status,
-              distance_km, price_per_km, fare, currency, requested_at
+            `SELECT id, rider_id, pickup_location, dropoff_location,
+              pickup_latitude, pickup_longitude, status,
+              distance_km, price_per_km, fare, fare_confirmed_by_rider, currency, requested_at
        FROM rides WHERE status = 'requested' ORDER BY requested_at ASC`
     );
 
@@ -257,7 +277,7 @@ router.patch('/:id/accept', requirePositiveIntegerParam('id'), requireApprovedDr
   } catch (error) {
     // Maps a leaked unique-index violation to the same friendly 409 clients
     // already get from the explicit active-ride check above.
-    if (error && error.code === '23505') {
+    if (error && error.code === '23505' && error.constraint === 'rides_one_active_per_driver') {
       if (client) {
         try { await client.query('ROLLBACK'); } catch (_) {}
       }
@@ -289,7 +309,12 @@ router.patch('/:id/status', requirePositiveIntegerParam('id'), requireApprovedDr
   try {
     client = await pool.connect();
     await client.query('BEGIN');
-    // Lock the ride row so the transition check and update below are atomic.
+    // Lock the acting driver first so concurrent availability / cancel /
+    // complete requests all take locks in the same order and can't deadlock.
+    await client.query(
+      `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+      [request.user.sub]
+    );
     const current = await client.query(
       `SELECT id, fare, fare_confirmed_by_rider, status
        FROM rides WHERE id = $1 AND driver_id = $2 FOR UPDATE`,
@@ -378,10 +403,27 @@ router.patch('/:id/status', requirePositiveIntegerParam('id'), requireApprovedDr
 });
 
 // Rider: confirms the driver-set fare on their own accepted or in-progress
-// ride. The update only matches a priced active ride, so anything else is a
-// 409 — no separate lookup needed.
+// ride. Wrong-user is 403; unpriced or wrong-status is 409. A second confirm
+// is idempotent and returns 200.
 router.patch('/:id/confirm-fare', requirePositiveIntegerParam('id'), async (request, response, next) => {
   try {
+    const current = await pool.query(
+      `SELECT id, rider_id, status, fare FROM rides WHERE id = $1`,
+      [request.params.id]
+    );
+
+    if (current.rowCount === 0) {
+      return response.status(404).json({ error: 'Ride not found.' });
+    }
+
+    if (String(current.rows[0].rider_id) !== String(request.user.sub)) {
+      return response.status(403).json({ error: 'You do not have permission to perform this action.' });
+    }
+
+    if (!['accepted', 'in_progress'].includes(current.rows[0].status) || current.rows[0].fare === null) {
+      return response.status(409).json({ error: 'Fare cannot be confirmed for this ride.' });
+    }
+
     const result = await pool.query(
       `UPDATE rides
        SET fare_confirmed_by_rider = true

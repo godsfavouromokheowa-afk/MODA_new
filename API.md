@@ -67,7 +67,7 @@ Password reset requests always return a generic response. In development only, t
 | GET | `/rides` | Authenticated — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
 | GET | `/rides/:id` | Authenticated — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
 | PATCH | `/rides/:id/cancel` | Authenticated |
-| PATCH | `/rides/:id/confirm-fare` | Ride's rider only, while `accepted`/`in_progress` with a priced fare — sets `fare_confirmed_by_rider=true`, else `409` |
+| PATCH | `/rides/:id/confirm-fare` | Ride's rider only, while `accepted`/`in_progress` with a priced fare — sets `fare_confirmed_by_rider=true`. Not the rider → `403`; unpriced or wrong status → `409`. A second confirm is idempotent (`200`). |
 
 A ride can only transition to `completed` when it has a fare **and** the rider has confirmed it (`fare_confirmed_by_rider=true`); otherwise completion returns `409 { error: 'Rider has not confirmed the fare.' }`. Price the ride (`PATCH /rides/:id/pricing`), have the rider confirm (`PATCH /rides/:id/confirm-fare`), then complete it.
 
@@ -114,7 +114,7 @@ Create a ride with:
 | PATCH | `/vehicles/:id/status` | Activate or deactivate a vehicle |
 | PATCH | `/vehicles/:id` | Edit a vehicle |
 | DELETE | `/vehicles/:id` | Delete an unused vehicle |
-| GET | `/rides/available/list` | List requested rides |
+| GET | `/rides/available/list` | List requested rides — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
 | PATCH | `/rides/:id/accept` | Accept a ride with an active vehicle |
 | PATCH | `/rides/:id/status` | Set `in_progress`, `completed`, or `cancelled` |
 | PATCH | `/rides/:id/pricing` | Set distance and current price per kilometre |
@@ -157,11 +157,11 @@ This produces `NGN 3,125.00`.
 | GET | `/admin/driver-applications` | Review driver applications |
 | PATCH | `/admin/driver-applications/:id` | Approve or reject an application |
 | PATCH | `/admin/users/:id/role` | Set `rider`, `driver`, or `admin` — demoting a driver clears approval to `not_applicable`; any actual role change forces re-login |
-| GET | `/admin/rides` | Monitor all rides |
+| GET | `/admin/rides` | Monitor all rides — includes `pickup_latitude`, `pickup_longitude`, and `fare_confirmed_by_rider` |
 | GET | `/admin/rides?status=requested` | Filter rides by status |
-| PATCH | `/admin/rides/:id/assign` | Assign a matching driver and vehicle |
-| POST | `/admin/rides/:id/match` | Assign the nearest available driver with a recent location |
-| PATCH | `/admin/rides/:id/cancel` | Cancel an active ride |
+| PATCH | `/admin/rides/:id/assign` | Assign a matching **approved** driver and active vehicle |
+| POST | `/admin/rides/:id/match` | Assign the nearest available **approved** driver with a recent location |
+| PATCH | `/admin/rides/:id/cancel` | Cancel an active ride (transactional like accept; notifies rider and assigned driver after commit) |
 
 ## Health check
 
