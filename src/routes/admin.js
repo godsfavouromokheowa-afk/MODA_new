@@ -160,8 +160,10 @@ router.get('/rides', async (request, response, next) => {
     const result = await pool.query(
       `SELECT rides.id, rides.rider_id, riders.name AS rider_name,
               rides.driver_id, drivers.name AS driver_name, rides.vehicle_id,
-              rides.pickup_location, rides.dropoff_location, rides.status,
-              rides.distance_km, rides.price_per_km, rides.fare, rides.currency,
+              rides.pickup_location, rides.dropoff_location,
+              rides.pickup_latitude, rides.pickup_longitude, rides.status,
+              rides.distance_km, rides.price_per_km, rides.fare,
+              rides.fare_confirmed_by_rider, rides.currency,
               rides.requested_at, rides.accepted_at, rides.completed_at
        FROM rides
        JOIN users AS riders ON riders.id = rides.rider_id
@@ -218,7 +220,9 @@ router.patch('/rides/:id/assign', requirePositiveIntegerParam('id'), async (requ
        SET driver_id = $1, vehicle_id = $2, status = 'accepted', accepted_at = NOW()
        WHERE rides.id = $3 AND rides.status = 'requested'
          AND EXISTS (
-           SELECT 1 FROM users WHERE users.id = $1 AND users.role = 'driver'
+           SELECT 1 FROM users
+           WHERE users.id = $1 AND users.role = 'driver'
+             AND users.driver_application_status = 'approved'
          )
          AND EXISTS (
            SELECT 1 FROM vehicles
@@ -247,7 +251,7 @@ router.patch('/rides/:id/assign', requirePositiveIntegerParam('id'), async (requ
   } catch (error) {
     // Maps a leaked unique-index violation to the same friendly 409 clients
     // already get from the explicit active-ride check above.
-    if (error && error.code === '23505') {
+    if (error && error.code === '23505' && error.constraint === 'rides_one_active_per_driver') {
       if (client) {
         try { await client.query('ROLLBACK'); } catch (_) {}
       }
@@ -302,6 +306,7 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
        FROM users
        JOIN vehicles ON vehicles.driver_id = users.id AND vehicles.status = 'active'
        WHERE users.role = 'driver'
+         AND users.driver_application_status = 'approved'
          AND users.availability = 'available'
            AND NOT EXISTS (
              SELECT 1 FROM rides active_rides
@@ -378,7 +383,7 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
   } catch (error) {
     // Maps a leaked unique-index violation to the same friendly 409 clients
     // already get from the explicit active-ride check above.
-    if (error && error.code === '23505') {
+    if (error && error.code === '23505' && error.constraint === 'rides_one_active_per_driver') {
       if (client) {
         try { await client.query('ROLLBACK'); } catch (_) {}
       }
@@ -394,10 +399,30 @@ router.post('/rides/:id/match', requirePositiveIntegerParam('id'), async (reques
 });
 
 router.patch('/rides/:id/cancel', requirePositiveIntegerParam('id'), async (request, response, next) => {
-  const client = await pool.connect();
+  // Lock order: users then rides.
+  let client;
 
   try {
+    client = await pool.connect();
     await client.query('BEGIN');
+    const current = await client.query(
+      `SELECT id, rider_id, driver_id, status FROM rides
+       WHERE id = $1 AND status IN ('requested', 'accepted', 'in_progress')`,
+      [request.params.id]
+    );
+
+    if (current.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return response.status(409).json({ error: 'Ride cannot be cancelled.' });
+    }
+
+    if (current.rows[0].driver_id) {
+      await client.query(
+        `SELECT id FROM users WHERE id = $1 FOR UPDATE`,
+        [current.rows[0].driver_id]
+      );
+    }
+
     const result = await client.query(
       `UPDATE rides SET status = 'cancelled', completed_at = NOW()
        WHERE id = $1 AND status IN ('requested', 'accepted', 'in_progress')
@@ -421,30 +446,40 @@ router.patch('/rides/:id/cancel', requirePositiveIntegerParam('id'), async (requ
 
     await client.query('COMMIT');
 
-    await createNotification({
-      userId: result.rows[0].rider_id,
-      type: 'ride_cancelled',
-      title: 'Ride cancelled by dispatch',
-      message: 'An administrator cancelled your ride.',
-      data: { rideId: result.rows[0].id }
-    });
-
-    if (result.rows[0].driver_id) {
+    try {
       await createNotification({
-        userId: result.rows[0].driver_id,
+        userId: result.rows[0].rider_id,
         type: 'ride_cancelled',
         title: 'Ride cancelled by dispatch',
-        message: 'An administrator cancelled the assigned ride.',
+        message: 'An administrator cancelled your ride.',
         data: { rideId: result.rows[0].id }
       });
+    } catch (notificationError) {
+      console.error('Failed to create admin ride_cancelled notification:', notificationError);
+    }
+
+    if (result.rows[0].driver_id) {
+      try {
+        await createNotification({
+          userId: result.rows[0].driver_id,
+          type: 'ride_cancelled',
+          title: 'Ride cancelled by dispatch',
+          message: 'An administrator cancelled the assigned ride.',
+          data: { rideId: result.rows[0].id }
+        });
+      } catch (notificationError) {
+        console.error('Failed to create admin ride_cancelled driver notification:', notificationError);
+      }
     }
 
     return response.json({ ride: result.rows[0] });
   } catch (error) {
-    await client.query('ROLLBACK');
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch (_) {}
+    }
     return next(error);
   } finally {
-    client.release();
+    if (client) client.release();
   }
 });
 

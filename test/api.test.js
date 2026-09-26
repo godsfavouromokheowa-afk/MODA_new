@@ -10,6 +10,7 @@ const testEmail = `test-${testRunId}@example.com`;
 const testPassword = 'RideSafe123';
 const driverEmail = `driver-${testRunId}@example.com`;
 const riderEmail = `rider-${testRunId}@example.com`;
+const unapprovedDriverEmail = `unapproved-driver-${testRunId}@example.com`;
 
 test('JWT secret meets minimum security requirements', () => {
   assert.ok(env.jwtSecret.length >= 32);
@@ -32,21 +33,21 @@ after(async () => {
     await client.query('BEGIN');
     await client.query(
       `DELETE FROM payments
-       WHERE rider_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3))`,
-      [testEmail, driverEmail, riderEmail]
+       WHERE rider_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3, $4))`,
+      [testEmail, driverEmail, riderEmail, unapprovedDriverEmail]
     );
     await client.query(
-      `DELETE FROM rides WHERE rider_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3))
-       OR driver_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3))`,
-      [testEmail, driverEmail, riderEmail]
+      `DELETE FROM rides WHERE rider_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3, $4))
+       OR driver_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3, $4))`,
+      [testEmail, driverEmail, riderEmail, unapprovedDriverEmail]
     );
     await client.query(
-      'DELETE FROM vehicles WHERE driver_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3))',
-      [testEmail, driverEmail, riderEmail]
+      'DELETE FROM vehicles WHERE driver_id IN (SELECT id FROM users WHERE email IN ($1, $2, $3, $4))',
+      [testEmail, driverEmail, riderEmail, unapprovedDriverEmail]
     );
     await client.query(
-      'DELETE FROM users WHERE email IN ($1, $2, $3)',
-      [testEmail, driverEmail, riderEmail]
+      'DELETE FROM users WHERE email IN ($1, $2, $3, $4)',
+      [testEmail, driverEmail, riderEmail, unapprovedDriverEmail]
     );
     await client.query('COMMIT');
   } catch (error) {
@@ -109,6 +110,7 @@ test('registration and login return public user data and a token', async () => {
     .send({ name: 'Updated Rider' });
   assert.equal(profileUpdate.status, 200);
   assert.equal(profileUpdate.body.user.name, 'Updated Rider');
+  assert.equal(profileUpdate.body.user.token_version, undefined);
 
   const passwordChange = await request(app)
     .patch('/auth/me/password')
@@ -361,6 +363,26 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .send({ pickupLocation: 'Airport', dropoffLocation: 'Station' });
   assert.equal(rideRequest.status, 201);
 
+  const availableList = await request(app)
+    .get('/rides/available/list')
+    .set(driverHeaders);
+  assert.equal(availableList.status, 200);
+  const listedRide = availableList.body.rides.find((item) => item.id === rideRequest.body.ride.id);
+  assert.ok(listedRide);
+  assert.ok('pickup_latitude' in listedRide);
+  assert.ok('pickup_longitude' in listedRide);
+  assert.ok('fare_confirmed_by_rider' in listedRide);
+
+  const adminRides = await request(app)
+    .get('/admin/rides')
+    .set(adminHeaders);
+  assert.equal(adminRides.status, 200);
+  const adminListed = adminRides.body.rides.find((item) => item.id === rideRequest.body.ride.id);
+  assert.ok(adminListed);
+  assert.ok('pickup_latitude' in adminListed);
+  assert.ok('pickup_longitude' in adminListed);
+  assert.ok('fare_confirmed_by_rider' in adminListed);
+
   const nonDriverAccept = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/accept`)
     .set(riderHeaders)
@@ -533,7 +555,8 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
   const nonRiderConfirm = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/confirm-fare`)
     .set(driverHeaders);
-  assert.equal(nonRiderConfirm.status, 409);
+  assert.equal(nonRiderConfirm.status, 403);
+  assert.deepEqual(nonRiderConfirm.body, { error: 'You do not have permission to perform this action.' });
 
   const confirmedFare = await request(app)
     .patch(`/rides/${rideRequest.body.ride.id}/confirm-fare`)
@@ -649,6 +672,48 @@ test('driver workflow enforces roles and calculates NGN pricing', async () => {
     .get('/drivers/me')
     .set(driverHeaders);
   assert.equal(staleDriverProfile.status, 403);
+
+  const unapprovedDriver = await registerUser('Unapproved Driver', unapprovedDriverEmail);
+  await pool.query(
+    `UPDATE users
+     SET role = 'driver',
+         availability = 'available',
+         latitude = 6.5244,
+         longitude = 3.3792,
+         location_updated_at = NOW()
+     WHERE id = $1`,
+    [unapprovedDriver.user.id]
+  );
+  const unapprovedVehicle = await pool.query(
+    `INSERT INTO vehicles (driver_id, make, model, license_plate, status)
+     VALUES ($1, 'Toyota', 'Camry', $2, 'active')
+     RETURNING id`,
+    [unapprovedDriver.user.id, `UNAPP${testRunId}`]
+  );
+
+  const unapprovedMatchRide = await request(app)
+    .post('/rides')
+    .set(riderHeaders)
+    .send({
+      pickupLocation: 'Unapproved Pickup',
+      dropoffLocation: 'Unapproved Dropoff',
+      pickupLatitude: 6.5244,
+      pickupLongitude: 3.3792
+    });
+  assert.equal(unapprovedMatchRide.status, 201);
+
+  const unapprovedMatch = await request(app)
+    .post(`/admin/rides/${unapprovedMatchRide.body.ride.id}/match`)
+    .set(adminHeaders);
+  assert.equal(unapprovedMatch.status, 409);
+  assert.equal(unapprovedMatch.body.error, 'No available driver with a recent location was found.');
+
+  const unapprovedAssign = await request(app)
+    .patch(`/admin/rides/${unapprovedMatchRide.body.ride.id}/assign`)
+    .set(adminHeaders)
+    .send({ driverId: unapprovedDriver.user.id, vehicleId: unapprovedVehicle.rows[0].id });
+  assert.equal(unapprovedAssign.status, 409);
+  assert.equal(unapprovedAssign.body.error, 'Ride is unavailable or driver and vehicle do not match.');
 
   const passwordStaleToken = riderHeaders.Authorization;
 
