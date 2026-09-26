@@ -66,6 +66,7 @@ test('health reports a connected database', async () => {
   assert.equal(response.status, 200);
   assert.deepEqual(response.body, { status: 'ok', database: 'connected' });
   assert.equal(response.headers['x-content-type-options'], 'nosniff');
+  assert.ok(response.headers['strict-transport-security']);
   assert.equal(response.headers['access-control-allow-origin'], '*');
   assert.ok(response.headers['x-request-id']);
   assert.match(response.headers.ratelimit, /300-in-15min/);
@@ -77,6 +78,15 @@ test('unknown routes return JSON errors with request IDs', async () => {
   assert.equal(response.status, 404);
   assert.deepEqual(response.body, { error: 'Route not found.' });
   assert.ok(response.headers['x-request-id']);
+});
+
+test('rejects oversized JSON bodies', async () => {
+  const response = await request(app)
+    .post('/auth/register')
+    .send({ name: 'x'.repeat(40 * 1024), email: `oversize-${testRunId}@example.com`, password: testPassword });
+
+  assert.equal(response.status, 413);
+  assert.deepEqual(response.body, { error: 'Request body is too large.' });
 });
 
 test('registration and login return public user data and a token', async () => {

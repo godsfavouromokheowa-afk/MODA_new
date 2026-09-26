@@ -20,6 +20,11 @@ npm run bootstrap-admin -- user@example.com
 The script refuses to run if an admin already exists. Later role changes should use the admin API.
 
 Set `DATABASE_URL`, `DATABASE_SSL`, a random `JWT_SECRET` of at least 32 characters, and `CORS_ORIGINS` in `.env`. Placeholder JWT secrets containing `replace`, `example`, or `change-me` are rejected at startup.
+In production `CORS_ORIGINS` must be an explicit https origin list — `*` is rejected.
+JSON request bodies are capped at 32 KB.
+Put the API behind HTTPS at the host (Render, Railway, Fly, nginx). Helmet sends `Strict-Transport-Security` so browsers refuse later HTTP.
+When `DATABASE_SSL=true`, certificate verification is on in production (`DATABASE_SSL_REJECT_UNAUTHORIZED=true`). Hosts with a private CA should set `DATABASE_SSL_CA` to the PEM or file path, or set `DATABASE_SSL_REJECT_UNAUTHORIZED=false` only if the host requires it.
+Password reset emails are sent when `SMTP_HOST` and `SMTP_FROM` are set (optional `SMTP_USER` / `SMTP_PASS` / `SMTP_PORT`, default 587). Optional `APP_PUBLIC_URL` turns the email into a link (`/reset-password?token=...`). Without SMTP, the token is stored but not delivered; it is returned in the JSON **only** in `development` and `test`. Production never puts `resetToken` in the response.
 Use a comma-separated origin list for deployed frontends, for example `https://app.example.com`.
 The API listens on `http://localhost:3000`.
 Versioned clients can use the same endpoints under `/api/v1`, for example `GET /api/v1/health`.
@@ -57,7 +62,7 @@ Password change (`PATCH /auth/me/password`) and password reset confirmation (`PO
 | PATCH | `/auth/me` | Authenticated |
 | PATCH | `/auth/me/password` | Authenticated |
 
-Password reset requests always return a generic response. In development only, the response includes `resetToken` so the flow can be tested before an email provider is configured. Production should deliver that token through email or SMS instead.
+Password reset requests always return a generic response. In `development` and `test` only, the response includes `resetToken` so the flow can be tested without SMTP. Production delivers that token by email when SMTP is configured. Never log or commit `JWT_SECRET`, `DATABASE_URL`, or `SMTP_PASS`.
 
 ## Rider endpoints
 
