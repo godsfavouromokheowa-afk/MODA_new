@@ -30,7 +30,7 @@ async function sendPasswordResetEmail({ to, resetToken }) {
   }
 
   const resetUrl = env.appPublicUrl
-    ? `${env.appPublicUrl}/reset-password?token=${encodeURIComponent(resetToken)}`
+    ? `${env.appPublicUrl}/password-reset/confirm?token=${encodeURIComponent(resetToken)}`
     : null;
   const text = resetUrl
     ? `Reset your MODA password (expires in 1 hour):\n${resetUrl}\n\nIf you did not request this, ignore this email.`
